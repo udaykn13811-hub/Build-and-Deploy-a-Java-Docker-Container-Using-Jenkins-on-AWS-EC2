@@ -1,0 +1,355 @@
+
+Prepare the Jenkins EC2 instance:
+
+Step 1.1 — Check the existing installation
+
+java -version
+mvn -version
+docker --version
+sudo systemctl status jenkins
+
+Step 1.2 — Install Java 21 and Maven
+
+sudo dnf update -y
+sudo dnf install -y java-21-amazon-corretto-devel maven git curl
+
+
+java -version
+mvn -version
+git --version
+
+
+Step 1.3 — Install Docker
+
+sudo dnf install -y docker
+sudo systemctl enable --now docker
+
+sudo docker version
+sudo docker ps
+
+
+Step 1.4 — Allow Jenkins to use Docker
+
+sudo usermod -aG docker jenkins
+sudo systemctl restart jenkins
+
+
+sudo -u jenkins -H bash -c 'id'
+sudo -u jenkins -H bash -c 'docker ps'
+
+
+2. Create the Java application
+
+Step 2.1 — Create the project directory
+
+mkdir java-docker-demo
+cd java-docker-demo
+
+mkdir -p src/main/java/com/aa/demo
+
+
+The completed project structure will be:
+
+java-docker-demo/
+├── src/
+│   └── main/
+│       └── java/
+│           └── com/
+│               └── aa/
+│                   └── demo/
+│                       └── App.java
+├── pom.xml
+├── Dockerfile
+├── .dockerignore
+└── Jenkinsfile
+
+
+Step 2.2 — Create App.java
+
+Create this file:
+
+src/main/java/com/aa/demo/App.java
+
+Paste the following code:
+
+
+package com.aa.demo;
+
+import com.sun.net.httpserver.HttpServer;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
+
+public class App {
+    public static void main(String[] args) throws Exception {
+        int port = Integer.parseInt(
+            System.getenv().getOrDefault("PORT", "8081")
+        );
+
+        HttpServer server = HttpServer.create(
+            new InetSocketAddress("0.0.0.0", port), 0
+        );
+
+        server.createContext("/", exchange -> {
+            String response = """
+                Java Docker Demo is running!
+                Built and deployed using Jenkins.
+                Application: java-docker-demo
+                """;
+
+            byte[] body = response.getBytes(StandardCharsets.UTF_8);
+
+            exchange.getResponseHeaders()
+                .set("Content-Type", "text/plain; charset=UTF-8");
+
+            exchange.sendResponseHeaders(200, body.length);
+
+            try (OutputStream output = exchange.getResponseBody()) {
+                output.write(body);
+            }
+        });
+
+        server.start();
+        System.out.println("Java application started on port " + port);
+    }
+}
+
+
+
+
+Step 2.3 — Create pom.xml
+
+
+
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+         https://maven.apache.org/xsd/maven-4.0.0.xsd">
+
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.aa</groupId>
+    <artifactId>java-docker-demo</artifactId>
+    <version>1.0.0</version>
+
+    <properties>
+        <maven.compiler.release>21</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    </properties>
+
+    <build>
+        <finalName>java-docker-demo</finalName>
+
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.13.0</version>
+            </plugin>
+
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <version>3.4.2</version>
+                <configuration>
+                    <archive>
+                        <manifest>
+                            <mainClass>com.aa.demo.App</mainClass>
+                        </manifest>
+                    </archive>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+
+
+
+
+
+Step 2.4 — Test the Java application build
+
+mvn clean package
+
+Expected artifact:
+target/java-docker-demo.jar
+
+Test it locally if Java 21 is installed:
+java -jar target/java-docker-demo.jar
+
+
+3. Create the Docker configuration
+
+Step 3.1 — Create Dockerfile
+In the project root, create a file named Dockerfile:
+
+
+FROM eclipse-temurin:21-jre
+
+WORKDIR /app
+
+COPY target/java-docker-demo.jar app.jar
+
+ENV PORT=8081
+
+EXPOSE 8081
+
+ENTRYPOINT ["java", "-jar", "app.jar"]
+
+
+
+
+Step 3.2 — Test Docker manually once
+
+docker build -t java-docker-demo:manual .
+
+docker run -d \
+  --name java-docker-demo-test \
+  -p 8081:8081 \
+  java-docker-demo:manual
+
+
+docker ps
+docker logs java-docker-demo-test
+docker images
+
+
+
+4. Create the Jenkins pipeline
+
+Step 4.1 — Create Jenkinsfile
+In the root of your GitHub repository, create a file named exactly Jenkinsfile (no extension).
+
+
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+    }
+
+    environment {
+        APP_NAME = 'java-docker-demo'
+        APP_PORT = '8081'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Check Tools') {
+            steps {
+                sh '''
+                    set -eu
+                    java -version
+                    mvn -version
+                    docker --version
+                '''
+            }
+        }
+
+        stage('Build Java Application') {
+            steps {
+                sh 'mvn -B clean package'
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                sh '''
+                    set -eu
+                    docker build \
+                      -t ${APP_NAME}:${BUILD_NUMBER} \
+                      -t ${APP_NAME}:latest .
+                '''
+            }
+        }
+
+        stage('Deploy Container') {
+            steps {
+                sh '''
+                    set -eu
+
+                    docker rm -f ${APP_NAME} || true
+
+                    docker run -d \
+                      --name ${APP_NAME} \
+                      --restart unless-stopped \
+                      -p ${APP_PORT}:${APP_PORT} \
+                      -e PORT=${APP_PORT} \
+                      ${APP_NAME}:${BUILD_NUMBER}
+                '''
+            }
+        }
+
+        stage('Verify Application') {
+            steps {
+                sh '''
+                    set -eu
+
+                    for attempt in $(seq 1 15); do
+                        if curl --fail --silent \
+                          http://127.0.0.1:${APP_PORT}/; then
+                            echo "Application is responding."
+                            exit 0
+                        fi
+
+                        sleep 2
+                    done
+
+                    echo "Application health check failed."
+                    docker logs ${APP_NAME}
+                    exit 1
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'SUCCESS: Java application built and deployed in Docker.'
+        }
+
+        failure {
+            echo 'FAILED: Review the stage logs and Docker container logs.'
+        }
+
+        always {
+            sh 'docker images java-docker-demo || true'
+        }
+    }
+}
+
+
+
+Step 4.2 - Create the Jenkins job:
+http://YOUR_EC2_PUBLIC_IP:8080
+
+Step 1 — Create a job
+
+Click New Item, enter the job name java-docker-demo-pipeline, select Pipeline, and click OK.
+
+Step 2 — Configure source control
+
+Scroll to the Pipeline section. Select Pipeline script from SCM, select Git, and enter your repository URL.
+
+step 3 — Set the branch and script
+
+Set the branch specifier to */main and the Script Path to Jenkinsfile. Click Save.
+
+
+step 4 - Run the project
+
+
+Open java-docker-demo-pipeline in Jenkins and click Build Now.
+
+Open the build number and select Console Output.
+
+
+
+
