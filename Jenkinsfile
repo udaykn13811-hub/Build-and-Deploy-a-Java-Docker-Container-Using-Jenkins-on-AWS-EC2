@@ -2,29 +2,33 @@
 pipeline {
     agent any
 
-    options {
-        timestamps()
-        disableConcurrentBuilds()
-    }
-
     environment {
         APP_NAME = 'java-docker-demo'
+        IMAGE_NAME = 'java-docker-demo:latest'
+        CONTAINER_NAME = 'java-docker-demo'
         APP_PORT = '8081'
+        JAVA_HOME = '/usr/lib/jvm/java-21-amazon-corretto.x86_64'
+        PATH = "${JAVA_HOME}/bin:${env.PATH}"
     }
 
     stages {
-        stage('Checkout') {
+        stage('Checkout Source Code') {
             steps {
+                echo 'Checking out source code from GitHub...'
                 checkout scm
             }
         }
 
-        stage('Check Tools') {
+        stage('Verify Java and Maven') {
             steps {
                 sh '''
-                    set -eu
+                    echo "Java version:"
                     java -version
+
+                    echo "Maven version:"
                     mvn -version
+
+                    echo "Docker version:"
                     docker --version
                 '''
             }
@@ -32,56 +36,62 @@ pipeline {
 
         stage('Build Java Application') {
             steps {
-                sh 'mvn -B clean package'
+                sh '''
+                    set -e
+                    mvn -B clean package
+                    ls -lh target/
+                '''
             }
         }
 
         stage('Build Docker Image') {
             steps {
                 sh '''
-                    set -eu
-                    docker build \
-                      -t ${APP_NAME}:${BUILD_NUMBER} \
-                      -t ${APP_NAME}:latest .
+                    set -e
+                    docker build -t "$IMAGE_NAME" .
+                    docker image inspect "$IMAGE_NAME"
                 '''
             }
         }
 
-        stage('Deploy Container') {
+        stage('Deploy Docker Container') {
             steps {
                 sh '''
-                    set -eu
+                    set -e
 
-                    docker rm -f ${APP_NAME} || true
+                    # Stop and remove the previous container if it exists
+                    if docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
+                        docker stop "$CONTAINER_NAME" || true
+                        docker rm "$CONTAINER_NAME" || true
+                    fi
 
+                    # Start the newly built container
                     docker run -d \
-                      --name ${APP_NAME} \
-                      --restart unless-stopped \
-                      -p ${APP_PORT}:${APP_PORT} \
-                      -e PORT=${APP_PORT} \
-                      ${APP_NAME}:${BUILD_NUMBER}
+                        --name "$CONTAINER_NAME" \
+                        --restart unless-stopped \
+                        -p "$APP_PORT:$APP_PORT" \
+                        "$IMAGE_NAME"
+
+                    echo "Container deployed successfully."
+                    docker ps
                 '''
             }
         }
 
-        stage('Verify Application') {
+        stage('Verify Deployment') {
             steps {
                 sh '''
-                    set -eu
+                    set -e
 
-                    for attempt in $(seq 1 15); do
-                        if curl --fail --silent \
-                          http://127.0.0.1:${APP_PORT}/; then
-                            echo "Application is responding."
-                            exit 0
-                        fi
+                    echo "Waiting for application startup..."
+                    sleep 5
 
-                        sleep 2
-                    done
+                    echo "Testing application endpoint..."
+                    curl --fail --show-error \
+                        "http://127.0.0.1:$APP_PORT/"
 
-                    echo "Application health check failed."
-                    docker logs ${APP_NAME}
-                    exit 1
+                    echo ""
+                    echo "Application deployment verified."
                 '''
             }
         }
@@ -90,14 +100,16 @@ pipeline {
     post {
         success {
             echo 'SUCCESS: Java application built and deployed in Docker.'
+            echo 'Access the application at http://YOUR_EC2_PUBLIC_IP:8081'
         }
 
         failure {
-            echo 'FAILED: Review the stage logs and Docker container logs.'
+            echo 'FAILURE: Check the Jenkins Console Output for the error.'
+            sh 'docker logs java-docker-demo || true'
         }
 
         always {
-            sh 'docker images java-docker-demo || true'
+            echo 'Pipeline execution completed.'
         }
     }
 }
